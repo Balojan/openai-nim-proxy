@@ -1,4 +1,4 @@
-// server.js - OpenAI to NVIDIA NIM API Proxy
+// server.js - OpenAI to NVIDIA NIM API Proxy (Complete with streaming)
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -20,7 +20,7 @@ const SHOW_REASONING = false; // Set to true to show reasoning with <think> tags
 // 🔥 THINKING MODE TOGGLE - Enables thinking for specific models that support it
 const ENABLE_THINKING_MODE = false; // Set to true to enable chat_template_kwargs thinking parameter
 
-// Model mapping (adjust based on available NIM models)
+// Model mapping
 const MODEL_MAPPING = {
   'gpt-3.5-turbo': 'nvidia/llama-3.1-nemotron-ultra-253b-v1',
   'gpt-4': 'qwen/qwen3-coder-480b-a35b-instruct',
@@ -28,9 +28,14 @@ const MODEL_MAPPING = {
   'gpt-4o': 'deepseek-ai/deepseek-v3.1',
   'claude-3-opus': 'openai/gpt-oss-120b',
   'claude-3-sonnet': 'openai/gpt-oss-20b',
-  'deepseek-v4-flash': 'deepseek-ai/deepseek-v4-flash',
-  'gemini-pro': 'qwen/qwen3-next-80b-a3b-thinking' 
+  'gemini-pro': 'qwen/qwen3-next-80b-a3b-thinking',
+  'deepseek-v4-flash': 'deepseek-ai/deepseek-v4-flash'
 };
+
+// Friendly root route - prevents "Endpoint / not found" error in Janitor AI
+app.get('/', (req, res) => {
+  res.send('OpenAI to NVIDIA NIM Proxy is running. Use /health to check status.');
+});
 
 // Health check endpoint
 app.get('/health', (req, res) => {
@@ -42,7 +47,7 @@ app.get('/health', (req, res) => {
   });
 });
 
-// List models endpoint (OpenAI compatible)
+// List models endpoint
 app.get('/v1/models', (req, res) => {
   const models = Object.keys(MODEL_MAPPING).map(model => ({
     id: model,
@@ -50,11 +55,7 @@ app.get('/v1/models', (req, res) => {
     created: Date.now(),
     owned_by: 'nvidia-nim-proxy'
   }));
-  
-  res.json({
-    object: 'list',
-    data: models
-  });
+  res.json({ object: 'list', data: models });
 });
 
 // Chat completions endpoint (main proxy)
@@ -62,7 +63,6 @@ app.post('/v1/chat/completions', async (req, res) => {
   try {
     const { model, messages, temperature, max_tokens, stream } = req.body;
     
-    // Smart model selection with fallback
     let nimModel = MODEL_MAPPING[model];
     if (!nimModel) {
       try {
@@ -92,7 +92,6 @@ app.post('/v1/chat/completions', async (req, res) => {
       }
     }
     
-    // Transform OpenAI request to NIM format
     const nimRequest = {
       model: nimModel,
       messages: messages,
@@ -102,7 +101,6 @@ app.post('/v1/chat/completions', async (req, res) => {
       stream: stream || false
     };
     
-    // Make request to NVIDIA NIM API
     const response = await axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
       headers: {
         'Authorization': `Bearer ${NIM_API_KEY}`,
@@ -112,7 +110,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     });
     
     if (stream) {
-      // Handle streaming response with reasoning
+      // --- STREAMING HANDLER (THIS IS THE CRITICAL PART YOU WERE MISSING) ---
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
@@ -181,8 +179,9 @@ app.post('/v1/chat/completions', async (req, res) => {
         console.error('Stream error:', err);
         res.end();
       });
+      // --- END OF STREAMING HANDLER ---
     } else {
-      // Transform NIM response to OpenAI format with reasoning
+      // Non-streaming response
       const openaiResponse = {
         id: `chatcmpl-${Date.now()}`,
         object: 'chat.completion',
@@ -216,7 +215,6 @@ app.post('/v1/chat/completions', async (req, res) => {
     
   } catch (error) {
     console.error('Proxy error:', error.message);
-    
     res.status(error.response?.status || 500).json({
       error: {
         message: error.message || 'Internal server error',
@@ -240,7 +238,4 @@ app.all('*', (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`OpenAI to NVIDIA NIM Proxy running on port ${PORT}`);
-  console.log(`Health check: http://localhost:${PORT}/health`);
-  console.log(`Reasoning display: ${SHOW_REASONING ? 'ENABLED' : 'DISABLED'}`);
-  console.log(`Thinking mode: ${ENABLE_THINKING_MODE ? 'ENABLED' : 'DISABLED'}`);
 });
