@@ -12,8 +12,8 @@ app.use(express.json());
 const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
 const NIM_API_KEY = process.env.NIM_API_KEY;
 
-const SHOW_REASONING = false;     // change to true to see <think> tags
-const ENABLE_THINKING_MODE = false; // change to true if your model requires it
+const SHOW_REASONING = true;     // change to true to see <think> tags
+const ENABLE_THINKING_MODE = true; // change to true if your model requires it
 
 // Map friendly model names (what you type in Janitor AI) to NVIDIA NIM model IDs
 const MODEL_MAPPING = {
