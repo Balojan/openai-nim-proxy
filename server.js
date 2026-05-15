@@ -26,6 +26,7 @@ const MODEL_MAPPING = {
   'gemini-pro': 'qwen/qwen3-next-80b-a3b-thinking',
   'glm-4.7': 'z-ai/glm4.7',
   'glm-5.1': 'z-ai/glm5.1',
+  'deepseek-v4-pro': 'deepseek-ai/deepseek-v4-pro'
   'deepseek-v4-flash': 'deepseek-ai/deepseek-v4-flash'
 };
 
