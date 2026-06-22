@@ -1,5 +1,5 @@
 // server.js - NVIDIA NIM Proxy for Janitor AI
-// Plugin-enabled: control thinking/reasoning from the system prompt
+// v2.1.0 - Per-model thinking config + gibberish fix
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -14,71 +14,176 @@ const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.c
 const NIM_API_KEY = process.env.NIM_API_KEY;
 
 // ──────────────────────────────────────────────
-// GLOBAL DEFAULTS (used when no plugin tags found)
+// GLOBAL DEFAULTS
 // ──────────────────────────────────────────────
-const SHOW_REASONING = false;       // global fallback
-const ENABLE_THINKING_MODE = false; // global fallback
+const SHOW_REASONING = false;
+const ENABLE_THINKING_MODE = false;
 
 // ──────────────────────────────────────────────
-// MODEL MAPPING — Janitor AI model name → NVIDIA NIM model ID
-// These are the ACTUAL NIM model IDs, not OpenAI names.
-// Janitor AI sends model names like "gpt-4", "claude-3-opus", etc.
-// We map those to real NIM models available on NVIDIA's API.
+// MODEL CONFIGURATION
+// Each model has its NIM ID + how to enable/disable thinking
 // ──────────────────────────────────────────────
-const MODEL_MAPPING = {
-  // OpenAI-style aliases (Janitor AI sends these)
-  'gpt-3.5-turbo':       'nvidia/llama-3.1-nemotron-ultra-253b-v1',
-  'gpt-4':               'qwen/qwen3-coder-480b-a35b-instruct',
-  'gpt-4-turbo':         'moonshotai/kimi-k2-instruct-0905',
-  'gpt-4o':              'deepseek-ai/deepseek-v3.1',
-  'gpt-4o-mini':         'deepseek-ai/deepseek-v4-flash',
+const MODEL_CONFIG = {
+  // ── DeepSeek ───────────────────────────────
+  'deepseek-v3.1': {
+    nimId: 'deepseek-ai/deepseek-v3.1',
+    thinking: { param: 'chat_template_kwargs', value: { thinking: true } },
+    noThinking: { param: 'chat_template_kwargs', value: { thinking: false } },
+    supportsReasoning: true,
+    reasoningField: 'reasoning_content'
+  },
+  'deepseek-v4': {
+    nimId: 'deepseek-ai/deepseek-v4',
+    thinking: { param: 'chat_template_kwargs', value: { thinking: true, reasoning_effort: 'high' } },
+    noThinking: { param: 'chat_template_kwargs', value: { thinking: false } },
+    supportsReasoning: true,
+    reasoningField: 'reasoning_content'
+  },
+  'deepseek-v4-flash': {
+    nimId: 'deepseek-ai/deepseek-v4-flash',
+    thinking: { param: 'chat_template_kwargs', value: { thinking: true } },
+    noThinking: { param: 'chat_template_kwargs', value: { thinking: false } },
+    supportsReasoning: true,
+    reasoningField: 'reasoning_content'
+  },
+  'deepseek-chat': {
+    nimId: 'deepseek-ai/deepseek-v3.1',
+    thinking: { param: 'chat_template_kwargs', value: { thinking: true } },
+    noThinking: { param: 'chat_template_kwargs', value: { thinking: false } },
+    supportsReasoning: true,
+    reasoningField: 'reasoning_content'
+  },
 
-  // Claude-style aliases
-  'claude-3-opus':       'openai/gpt-oss-120b',
-  'claude-3-sonnet':     'openai/gpt-oss-20b',
-  'claude-3-haiku':      'meta/llama-3.1-8b-instruct',
+  // ── GLM ────────────────────────────────────
+  'glm-5.1': {
+    nimId: 'z-ai/glm-5.1',
+    thinking: { param: 'chat_template_kwargs', value: { enable_thinking: true, clear_thinking: false } },
+    noThinking: { param: 'chat_template_kwargs', value: { enable_thinking: false } },
+    supportsReasoning: true,
+    reasoningField: 'reasoning_content'
+  },
+  'glm-4': {
+    nimId: 'z-ai/glm-5.1',
+    thinking: { param: 'chat_template_kwargs', value: { enable_thinking: true, clear_thinking: false } },
+    noThinking: { param: 'chat_template_kwargs', value: { enable_thinking: false } },
+    supportsReasoning: true,
+    reasoningField: 'reasoning_content'
+  },
 
-  // Gemini-style aliases
-  'gemini-pro':          'qwen/qwen3-next-80b-a3b-thinking',
-  'gemini-1.5-pro':      'qwen/qwen3-next-80b-a3b-thinking',
+  // ── Qwen ───────────────────────────────────
+  'qwen3-coder': {
+    nimId: 'qwen/qwen3-coder-480b-a35b-instruct',
+    thinking: { param: 'chat_template_kwargs', value: { enable_thinking: true } },
+    noThinking: { param: 'chat_template_kwargs', value: { enable_thinking: false } },
+    supportsReasoning: true,
+    reasoningField: 'reasoning_content'
+  },
+  'qwen3-next': {
+    nimId: 'qwen/qwen3-next-80b-a3b-thinking',
+    thinking: { param: 'chat_template_kwargs', value: { enable_thinking: true } },
+    noThinking: { param: 'chat_template_kwargs', value: { enable_thinking: false } },
+    supportsReasoning: true,
+    reasoningField: 'reasoning_content'
+  },
 
-  // DeepSeek aliases
-  'deepseek-v4':         'deepseek-ai/deepseek-v4',
-  'deepseek-v4-flash':   'deepseek-ai/deepseek-v4-flash',
-  'deepseek-v3.1':      'deepseek-ai/deepseek-v3.1',
-  'deepseek-chat':       'deepseek-ai/deepseek-v3.1',
+  // ── Kimi / Moonshot ────────────────────────
+  // WARNING: Kimi K2.6 returns content: null when thinking is enabled!
+  // Only enable thinking if you also use //SHOW_REASONING//
+  'kimi-k2': {
+    nimId: 'moonshotai/kimi-k2-instruct-0905',
+    thinking: { param: 'chat_template_kwargs', value: { thinking: true } },
+    noThinking: { param: 'chat_template_kwargs', value: { thinking: false } },
+    supportsReasoning: true,
+    reasoningField: 'reasoning_content',
+    contentNullWhenThinking: true
+  },
+  'kimi-k2.6': {
+    nimId: 'moonshotai/kimi-k2.6',
+    thinking: { param: 'chat_template_kwargs', value: { thinking: true } },
+    noThinking: { param: 'chat_template_kwargs', value: { thinking: false } },
+    supportsReasoning: true,
+    reasoningField: 'reasoning_content',
+    contentNullWhenThinking: true
+  },
 
-  // GLM aliases
-  'glm-5.1':             'z-ai/glm-5.1',
-  'glm-4':               'z-ai/glm-5.1',
+  // ── GPT-OSS ────────────────────────────────
+  // Always reasons, uses reasoning_effort to control depth
+  'gpt-oss-120b': {
+    nimId: 'openai/gpt-oss-120b',
+    thinking: { param: 'reasoning_effort', value: 'high' },
+    noThinking: { param: 'reasoning_effort', value: 'low' },
+    supportsReasoning: true,
+    reasoningField: 'reasoning_content',
+    alwaysReasons: true
+  },
+  'gpt-oss-20b': {
+    nimId: 'openai/gpt-oss-20b',
+    thinking: { param: 'reasoning_effort', value: 'high' },
+    noThinking: { param: 'reasoning_effort', value: 'low' },
+    supportsReasoning: true,
+    reasoningField: 'reasoning_content',
+    alwaysReasons: true
+  },
 
-  // Moonshot / Kimi aliases
-  'kimi-k2':             'moonshotai/kimi-k2-instruct-0905',
-  'kimi-k2.6':           'moonshotai/kimi-k2.6',
+  // ── Nemotron ───────────────────────────────
+  'nemotron-ultra': {
+    nimId: 'nvidia/llama-3.1-nemotron-ultra-253b-v1',
+    thinking: { param: 'chat_template_kwargs', value: { enable_thinking: true } },
+    noThinking: { param: 'chat_template_kwargs', value: { enable_thinking: false } },
+    supportsReasoning: true,
+    reasoningField: 'reasoning_content'
+  },
 
-  // Meta Llama direct aliases
-  'llama-3.1-8b':        'meta/llama-3.1-8b-instruct',
-  'llama-3.1-70b':       'meta/llama-3.1-70b-instruct',
-  'llama-3.1-405b':      'meta/llama-3.1-405b-instruct',
-  'llama-3.3-70b':       'meta/llama-3.3-70b-instruct',
-
-  // NVIDIA Nemotron aliases
-  'nemotron-ultra':      'nvidia/llama-3.1-nemotron-ultra-253b-v1',
-
-  // Qwen aliases
-  'qwen3-coder':         'qwen/qwen3-coder-480b-a35b-instruct',
-  'qwen3-next':          'qwen/qwen3-next-80b-a3b-thinking',
+  // ── Llama (no native reasoning) ──────────────
+  'llama-3.1-8b': {
+    nimId: 'meta/llama-3.1-8b-instruct',
+    supportsReasoning: false
+  },
+  'llama-3.1-70b': {
+    nimId: 'meta/llama-3.1-70b-instruct',
+    supportsReasoning: false
+  },
+  'llama-3.1-405b': {
+    nimId: 'meta/llama-3.1-405b-instruct',
+    supportsReasoning: false
+  },
+  'llama-3.3-70b': {
+    nimId: 'meta/llama-3.3-70b-instruct',
+    supportsReasoning: false
+  },
 };
 
-// Reverse mapping for logging/debugging (NIM ID → friendly name)
-const REVERSE_MODEL_MAP = Object.fromEntries(
-  Object.entries(MODEL_MAPPING).map(([k, v]) => [v, k])
-);
+// Janitor AI friendly names → config keys
+const MODEL_MAPPING = {
+  'gpt-3.5-turbo': 'nemotron-ultra',
+  'gpt-4': 'qwen3-coder',
+  'gpt-4-turbo': 'kimi-k2',
+  'gpt-4o': 'deepseek-v3.1',
+  'gpt-4o-mini': 'deepseek-v4-flash',
+  'claude-3-opus': 'gpt-oss-120b',
+  'claude-3-sonnet': 'gpt-oss-20b',
+  'claude-3-haiku': 'llama-3.1-8b',
+  'gemini-pro': 'qwen3-next',
+  'gemini-1.5-pro': 'qwen3-next',
+  'deepseek-v4': 'deepseek-v4',
+  'deepseek-v4-flash': 'deepseek-v4-flash',
+  'deepseek-v3.1': 'deepseek-v3.1',
+  'deepseek-chat': 'deepseek-chat',
+  'glm-5.1': 'glm-5.1',
+  'glm-4': 'glm-4',
+  'kimi-k2': 'kimi-k2',
+  'kimi-k2.6': 'kimi-k2.6',
+  'llama-3.1-8b': 'llama-3.1-8b',
+  'llama-3.1-70b': 'llama-3.1-70b',
+  'llama-3.1-405b': 'llama-3.1-405b',
+  'llama-3.3-70b': 'llama-3.3-70b',
+  'nemotron-ultra': 'nemotron-ultra',
+  'qwen3-coder': 'qwen3-coder',
+  'qwen3-next': 'qwen3-next',
+};
 
 // ──────────────────────────────────────────────
-// PLUGIN PARSER – reads //SHOW_THINKING// and
-// //SHOW_REASONING// from system messages, then
-// strips them before forwarding to the model.
+// PLUGIN PARSER
 // ──────────────────────────────────────────────
 function parsePlugins(messages) {
   let showReasoning = SHOW_REASONING;
@@ -88,23 +193,19 @@ function parsePlugins(messages) {
     return { messages, showReasoning, enableThinking };
   }
 
-  // Deep-clone to avoid mutating the original request
   const cleanedMessages = JSON.parse(JSON.stringify(messages));
 
   for (let i = 0; i < cleanedMessages.length; i++) {
     const msg = cleanedMessages[i];
     if (msg.role === 'system' && typeof msg.content === 'string') {
-      // Check for SHOW_REASONING tag
       if (msg.content.includes('//SHOW_REASONING//')) {
         showReasoning = true;
-        msg.content = msg.content.replace(/\/\/SHOW_REASONING\/\//g, '');
+        msg.content = msg.content.replace(/\/\/SHOW_REASONING\//g, '');
       }
-      // Check for SHOW_THINKING tag
       if (msg.content.includes('//SHOW_THINKING//')) {
         enableThinking = true;
-        msg.content = msg.content.replace(/\/\/SHOW_THINKING\/\//g, '');
+        msg.content = msg.content.replace(/\/\/SHOW_THINKING\//g, '');
       }
-      // Clean up leftover whitespace/newlines
       msg.content = msg.content.replace(/\n{3,}/g, '\n\n').trim();
     }
   }
@@ -114,56 +215,106 @@ function parsePlugins(messages) {
 
 // ──────────────────────────────────────────────
 // FALLBACK MODEL RESOLVER
-// Tries to find the best NIM model when mapping fails.
 // ──────────────────────────────────────────────
 async function resolveModel(model, apiKey, apiBase) {
-  // 1. Direct mapping hit
-  if (MODEL_MAPPING[model]) {
-    return { modelId: MODEL_MAPPING[model], source: 'mapped' };
+  const configKey = MODEL_MAPPING[model];
+  if (configKey && MODEL_CONFIG[configKey]) {
+    return { configKey, config: MODEL_CONFIG[configKey], source: 'mapped' };
   }
 
-  // 2. If the user already sent a valid NIM model ID (contains "/"), test it directly
+  // Direct NIM ID test
   if (model.includes('/')) {
     try {
       const test = await axios.post(
         `${apiBase}/chat/completions`,
+        { model: model, messages: [{ role: 'user', content: 'test' }], max_tokens: 1 },
         {
-          model: model,
-          messages: [{ role: 'user', content: 'test' }],
-          max_tokens: 1
-        },
-        {
-          headers: {
-            'Authorization': `Bearer ${apiKey}`,
-            'Content-Type': 'application/json'
-          },
+          headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
           validateStatus: (status) => status < 500,
           timeout: 10000
         }
       );
       if (test.status >= 200 && test.status < 300) {
-        return { modelId: model, source: 'direct-nim' };
+        return {
+          configKey: model,
+          config: { nimId: model, supportsReasoning: false },
+          source: 'direct-nim'
+        };
       }
-    } catch (e) {
-      // Direct test failed, fall through to heuristic
+    } catch (e) {}
+  }
+
+  // Heuristic fallback
+  const lower = model.toLowerCase();
+  if (lower.includes('405b') || lower.includes('ultra') || lower.includes('large')) {
+    return { configKey: 'llama-3.1-405b', config: MODEL_CONFIG['llama-3.1-405b'], source: 'heuristic-large' };
+  }
+  if (lower.includes('70b') || lower.includes('pro')) {
+    return { configKey: 'llama-3.1-70b', config: MODEL_CONFIG['llama-3.1-70b'], source: 'heuristic-medium' };
+  }
+  return { configKey: 'llama-3.1-8b', config: MODEL_CONFIG['llama-3.1-8b'], source: 'fallback' };
+}
+
+// ──────────────────────────────────────────────
+// APPLY THINKING CONFIG
+// Returns the correct parameter structure for the model
+// ──────────────────────────────────────────────
+function applyThinkingConfig(nimRequest, config, enableThinking) {
+  if (!config.supportsReasoning) {
+    // Model doesn't support reasoning at all — nothing to do
+    return;
+  }
+
+  const thinkingCfg = enableThinking ? config.thinking : config.noThinking;
+  if (!thinkingCfg) return;
+
+  if (thinkingCfg.param === 'chat_template_kwargs') {
+    nimRequest.chat_template_kwargs = thinkingCfg.value;
+  } else if (thinkingCfg.param === 'reasoning_effort') {
+    nimRequest.reasoning_effort = thinkingCfg.value;
+  }
+}
+
+// ──────────────────────────────────────────────
+// EXTRACT REASONING + CONTENT SAFELY
+// Handles models that return content: null with only reasoning_content
+// ──────────────────────────────────────────────
+function extractMessageParts(message, config, showReasoning) {
+  const reasoningField = config.reasoningField || 'reasoning_content';
+  const reasoning = message?.[reasoningField] || message?.reasoning || '';
+  let content = message?.content || '';
+
+  // CRITICAL FIX: Some models (Kimi) return content: null when thinking is on
+  // If content is null/empty but reasoning exists, use reasoning as content
+  // unless showReasoning is true (then we format it properly)
+  if ((!content || content === 'null') && reasoning) {
+    if (showReasoning) {
+      // Format: <think>reasoning</think>\n\n(content was null)
+      content = '';
+    } else {
+      // No reasoning display requested, but content is null
+      // Fall back to reasoning text so user isn't left with nothing
+      content = reasoning;
     }
   }
 
-  // 3. Heuristic fallback based on model name hints
-  const lower = model.toLowerCase();
+  return { reasoning, content };
+}
 
-  if (lower.includes('405b') || lower.includes('opus') || lower.includes('ultra') || lower.includes('large')) {
-    return { modelId: 'meta/llama-3.1-405b-instruct', source: 'heuristic-large' };
+// ──────────────────────────────────────────────
+// FORMAT REASONING FOR DISPLAY
+// ──────────────────────────────────────────────
+function formatWithReasoning(reasoning, content) {
+  // Use actual XML-like tags that render cleanly
+  let result = '';
+  if (reasoning) {
+    result += '<think>\n' + reasoning + '\n</think>';
   }
-  if (lower.includes('70b') || lower.includes('sonnet') || lower.includes('pro')) {
-    return { modelId: 'meta/llama-3.1-70b-instruct', source: 'heuristic-medium' };
+  if (content && content.trim()) {
+    if (result) result += '\n\n';
+    result += content;
   }
-  if (lower.includes('8b') || lower.includes('haiku') || lower.includes('mini') || lower.includes('flash')) {
-    return { modelId: 'meta/llama-3.1-8b-instruct', source: 'heuristic-small' };
-  }
-
-  // 4. Ultimate fallback
-  return { modelId: 'meta/llama-3.1-8b-instruct', source: 'fallback' };
+  return result;
 }
 
 // ──────────────────────────────────────────────
@@ -177,23 +328,18 @@ app.get('/', (req, res) => {
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
-    service: 'NVIDIA NIM Proxy for Janitor AI (plugin-enabled)',
-    version: '2.0.0',
+    service: 'NVIDIA NIM Proxy for Janitor AI',
+    version: '2.1.0',
     timestamp: new Date().toISOString()
   });
 });
 
-// GET fallback for Janitor AI's pre-check / uptime robot
 app.get('/v1/chat/completions', (req, res) => {
-  res.json({
-    status: 'ok',
-    message: 'Completions endpoint. Use POST to chat.',
-    available: true
-  });
+  res.json({ status: 'ok', message: 'Use POST to chat.', available: true });
 });
 
 // ──────────────────────────────────────────────
-// MAIN PROXY – POST /v1/chat/completions
+// MAIN PROXY
 // ──────────────────────────────────────────────
 app.post('/v1/chat/completions', async (req, res) => {
   const requestStart = Date.now();
@@ -201,19 +347,18 @@ app.post('/v1/chat/completions', async (req, res) => {
   try {
     const { model, messages, temperature, max_tokens, stream, top_p, frequency_penalty, presence_penalty } = req.body;
 
-    // ── Plugin injection ──────────────────────
+    // Parse plugins
     const pluginResult = parsePlugins(messages);
     const showReasoning = pluginResult.showReasoning;
     const enableThinking = pluginResult.enableThinking;
     const cleanedMessages = pluginResult.messages;
-    // ──────────────────────────────────────────
 
-    // ── Model resolution ──────────────────────
-    const { modelId: nimModel, source: modelSource } = await resolveModel(model, NIM_API_KEY, NIM_API_BASE);
-    console.log(`[${new Date().toISOString()}] Model resolved: "${model}" → "${nimModel}" (source: ${modelSource})`);
-    // ──────────────────────────────────────────
+    // Resolve model
+    const { configKey, config, source } = await resolveModel(model, NIM_API_KEY, NIM_API_BASE);
+    const nimModel = config.nimId;
+    console.log(`[${new Date().toISOString()}] "${model}" -> "${nimModel}" (via ${source}, thinking=${enableThinking}, reasoning=${showReasoning})`);
 
-    // ── Build NIM request ─────────────────────
+    // Build NIM request
     const nimRequest = {
       model: nimModel,
       messages: cleanedMessages,
@@ -222,35 +367,14 @@ app.post('/v1/chat/completions', async (req, res) => {
       stream: stream || false
     };
 
-    // Optional OpenAI-compatible parameters (pass through if provided)
     if (top_p !== undefined) nimRequest.top_p = top_p;
     if (frequency_penalty !== undefined) nimRequest.frequency_penalty = frequency_penalty;
     if (presence_penalty !== undefined) nimRequest.presence_penalty = presence_penalty;
 
-    // ── Thinking / Reasoning configuration ──────
-    // CORRECT FORMAT per your requirement:
-    // extra_body:
-    //   thinking:
-    //     type: disabled
-    //   chat_template_kwargs:
-    //     thinking: false
-    // ──────────────────────────────────────────
-    if (enableThinking) {
-      // User explicitly wants thinking enabled via //SHOW_THINKING//
-      nimRequest.extra_body = {
-        thinking: { type: "enabled" },
-        chat_template_kwargs: { thinking: true }
-      };
-    } else {
-      // Default: explicitly DISABLE thinking to prevent unwanted reasoning tokens
-      nimRequest.extra_body = {
-        thinking: { type: "disabled" },
-        chat_template_kwargs: { thinking: false }
-      };
-    }
-    // ──────────────────────────────────────────
+    // Apply per-model thinking config
+    applyThinkingConfig(nimRequest, config, enableThinking);
 
-    // ── Send to NVIDIA NIM ────────────────────
+    // Send to NVIDIA
     const response = await axios.post(
       `${NIM_API_BASE}/chat/completions`,
       nimRequest,
@@ -260,19 +384,21 @@ app.post('/v1/chat/completions', async (req, res) => {
           'Content-Type': 'application/json'
         },
         responseType: stream ? 'stream' : 'json',
-        timeout: 300000 // 5 minute timeout for long generations
+        timeout: 300000
       }
     );
 
-    // ── STREAMING RESPONSE ────────────────────
+    // ── STREAMING ────────────────────────────
     if (stream) {
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
-      res.setHeader('X-Accel-Buffering', 'no'); // Disable nginx buffering
+      res.setHeader('X-Accel-Buffering', 'no');
 
       let buffer = '';
-      let reasoningStarted = false;
+      let reasoningBuffer = '';
+      let contentBuffer = '';
+      let reasoningSent = false;
       let hasError = false;
 
       response.data.on('data', (chunk) => {
@@ -283,123 +409,162 @@ app.post('/v1/chat/completions', async (req, res) => {
 
         lines.forEach(line => {
           if (!line.startsWith('data: ')) return;
-
           if (line.includes('[DONE]')) {
+            // Flush any remaining reasoning before DONE
+            if (showReasoning && reasoningBuffer && !reasoningSent) {
+              const flushData = {
+                id: `chatcmpl-${Date.now()}`,
+                object: 'chat.completion.chunk',
+                created: Math.floor(Date.now() / 1000),
+                model: model,
+                choices: [{
+                  index: 0,
+                  delta: { content: '\n</think>\n\n' + contentBuffer },
+                  finish_reason: null
+                }]
+              };
+              res.write(`data: ${JSON.stringify(flushData)}\n\n`);
+              reasoningBuffer = '';
+              contentBuffer = '';
+            }
             res.write(line + '\n');
             return;
           }
 
           try {
             const data = JSON.parse(line.slice(6));
-
-            if (data.choices?.[0]?.delta) {
-              const reasoning = data.choices[0].delta.reasoning_content;
-              const content = data.choices[0].delta.content;
-
-              if (showReasoning) {
-                let combinedContent = '';
-
-                if (reasoning && !reasoningStarted) {
-                  combinedContent = '\u003cthink\u003e\n' + reasoning;
-                  reasoningStarted = true;
-                } else if (reasoning) {
-                  combinedContent = reasoning;
-                }
-
-                if (content && reasoningStarted) {
-                  combinedContent += '\n\u003c/think\u003e\n\n' + content;
-                  reasoningStarted = false;
-                } else if (content) {
-                  combinedContent += content;
-                }
-
-                if (combinedContent) {
-                  data.choices[0].delta.content = combinedContent;
-                  delete data.choices[0].delta.reasoning_content;
-                }
-              } else {
-                // Don't show reasoning — only pass through content
-                if (content) {
-                  data.choices[0].delta.content = content;
-                } else {
-                  data.choices[0].delta.content = '';
-                }
-                delete data.choices[0].delta.reasoning_content;
-              }
+            if (!data.choices?.[0]?.delta) {
+              res.write(line + '\n');
+              return;
             }
 
-            res.write(`data: ${JSON.stringify(data)}\n\n`);
+            const delta = data.choices[0].delta;
+            const reasoningChunk = delta.reasoning_content || delta.reasoning || '';
+            const contentChunk = delta.content || '';
+
+            if (showReasoning && config.supportsReasoning) {
+              // Buffer reasoning until we see content, then emit formatted block
+              if (reasoningChunk) {
+                if (!reasoningSent) {
+                  reasoningBuffer = '<think>\n' + reasoningChunk;
+                  reasoningSent = true;
+                } else {
+                  reasoningBuffer += reasoningChunk;
+                }
+              }
+
+              if (contentChunk) {
+                if (reasoningSent) {
+                  // Emit reasoning + transition + content
+                  data.choices[0].delta.content = reasoningBuffer + '\n</think>\n\n' + contentChunk;
+                  reasoningBuffer = '';
+                  reasoningSent = false;
+                } else {
+                  data.choices[0].delta.content = contentChunk;
+                }
+                delete data.choices[0].delta.reasoning_content;
+                delete data.choices[0].delta.reasoning;
+                res.write(`data: ${JSON.stringify(data)}\n\n`);
+              } else if (reasoningChunk && reasoningSent) {
+                // Still receiving reasoning, don't emit yet
+                return;
+              }
+            } else {
+              // Don't show reasoning — only forward content
+              // CRITICAL: If content is null/empty but reasoning exists,
+              // some models leak reasoning into content. Filter it.
+              if (contentChunk && contentChunk.trim()) {
+                data.choices[0].delta.content = contentChunk;
+              } else {
+                data.choices[0].delta.content = '';
+              }
+              delete data.choices[0].delta.reasoning_content;
+              delete data.choices[0].delta.reasoning;
+              res.write(`data: ${JSON.stringify(data)}\n\n`);
+            }
           } catch (e) {
-            // If JSON parse fails, forward raw line to avoid breaking stream
             res.write(line + '\n');
           }
         });
       });
 
       response.data.on('end', () => {
+        // Flush remaining buffered reasoning
+        if (showReasoning && reasoningBuffer) {
+          const flushData = {
+            id: `chatcmpl-${Date.now()}`,
+            object: 'chat.completion.chunk',
+            created: Math.floor(Date.now() / 1000),
+            model: model,
+            choices: [{
+              index: 0,
+              delta: { content: '\n</think>\n\n' + (contentBuffer || '') },
+              finish_reason: 'stop'
+            }]
+          };
+          res.write(`data: ${JSON.stringify(flushData)}\n\n`);
+        }
         res.write('data: [DONE]\n\n');
         res.end();
-        const duration = Date.now() - requestStart;
-        console.log(`[${new Date().toISOString()}] Stream completed in ${duration}ms`);
+        console.log(`[${new Date().toISOString()}] Stream done in ${Date.now() - requestStart}ms`);
       });
 
       response.data.on('error', (err) => {
         hasError = true;
         console.error('Stream error:', err.message);
-        res.write(`data: ${JSON.stringify({ error: { message: 'Stream error: ' + err.message } })}\n\n`);
+        res.write(`data: ${JSON.stringify({ error: { message: 'Stream error' } })}\n\n`);
         res.end();
       });
 
-      // Handle client disconnect
       req.on('close', () => {
-        if (!res.writableEnded) {
-          console.log(`[${new Date().toISOString()}] Client disconnected, ending stream`);
-          res.end();
-        }
+        if (!res.writableEnded) res.end();
       });
 
-    // ── NON-STREAMING RESPONSE ────────────────
+    // ── NON-STREAMING ────────────────────────
     } else {
+      const choice = response.data.choices?.[0];
+      const msg = choice?.message;
+
+      const { reasoning, content } = extractMessageParts(msg, config, showReasoning);
+
+      let finalContent = content;
+      if (showReasoning && reasoning) {
+        finalContent = formatWithReasoning(reasoning, content);
+      }
+
+      // If content is still empty after all handling, use reasoning as fallback
+      if (!finalContent || finalContent === 'null') {
+        finalContent = reasoning || '[No response content]';
+      }
+
       const openaiResponse = {
         id: `chatcmpl-${Date.now()}`,
         object: 'chat.completion',
         created: Math.floor(Date.now() / 1000),
-        model: model, // Return the ORIGINAL model name Janitor AI sent
-        choices: response.data.choices.map(choice => {
-          let content = choice.message?.content || '';
-
-          if (showReasoning && choice.message?.reasoning_content) {
-            content = '\u003cthink\u003e\n' + choice.message.reasoning_content + '\n\u003c/think\u003e\n\n' + content;
-          }
-
-          return {
-            index: choice.index,
-            message: { role: choice.message.role, content },
-            finish_reason: choice.finish_reason
-          };
-        }),
+        model: model,
+        choices: [{
+          index: 0,
+          message: { role: msg?.role || 'assistant', content: finalContent },
+          finish_reason: choice?.finish_reason || 'stop'
+        }],
         usage: response.data.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
       };
 
       res.json(openaiResponse);
-      const duration = Date.now() - requestStart;
-      console.log(`[${new Date().toISOString()}] Request completed in ${duration}ms`);
+      console.log(`[${new Date().toISOString()}] Done in ${Date.now() - requestStart}ms`);
     }
-
+    
   } catch (error) {
-    const duration = Date.now() - requestStart;
-    console.error(`[${new Date().toISOString()}] Proxy error after ${duration}ms:`, error.message);
-
-    // Don't crash — return a proper OpenAI-style error
+    console.error(`[${new Date().toISOString()}] Error:`, error.message);
     const statusCode = error.response?.status || 500;
-    const errorMessage = error.response?.data?.error?.message 
-      || error.response?.data?.message 
-      || error.message 
+    const errorMsg = error.response?.data?.error?.message
+      || error.response?.data?.message
+      || error.message
       || 'Internal server error';
 
     res.status(statusCode).json({
       error: {
-        message: errorMessage,
+        message: errorMsg,
         type: statusCode >= 500 ? 'internal_server_error' : 'invalid_request_error',
         code: statusCode
       }
@@ -407,35 +572,35 @@ app.post('/v1/chat/completions', async (req, res) => {
   }
 });
 
-// ──────────────────────────────────────────────
-// MODEL LIST ENDPOINT (for debugging)
-// ──────────────────────────────────────────────
+// Model list endpoint
 app.get('/v1/models', (req, res) => {
-  const models = Object.entries(MODEL_MAPPING).map(([id, nimId]) => ({
-    id,
-    object: 'model',
-    owned_by: nimId.split('/')[0],
-    nim_model_id: nimId
-  }));
+  const models = Object.entries(MODEL_MAPPING).map(([id, configKey]) => {
+    const cfg = MODEL_CONFIG[configKey];
+    return {
+      id,
+      object: 'model',
+      owned_by: cfg.nimId.split('/')[0],
+      nim_model_id: cfg.nimId,
+      supports_reasoning: cfg.supportsReasoning,
+      thinking_param: cfg.supportsReasoning ? (cfg.thinking?.param || 'none') : 'n/a'
+    };
+  });
   res.json({ object: 'list', data: models });
 });
 
-// Catch-all 404
 app.all('*', (req, res) => {
-  res.status(404).json({
-    error: { message: `Endpoint ${req.method} ${req.path} not found` }
-  });
+  res.status(404).json({ error: { message: `Endpoint ${req.method} ${req.path} not found` } });
 });
 
 app.listen(PORT, () => {
   console.log(`═══════════════════════════════════════════════`);
   console.log(`  NVIDIA NIM Proxy for Janitor AI`);
-  console.log(`  Version: 2.0.0`);
+  console.log(`  Version: 2.1.0`);
   console.log(`  Port: ${PORT}`);
   console.log(`  API Base: ${NIM_API_BASE}`);
-  console.log(`  API Key: ${NIM_API_KEY ? '✓ Set' : '✗ NOT SET — proxy will fail!'}`);
+  console.log(`  API Key: ${NIM_API_KEY ? 'Set' : 'NOT SET!'}`);
   console.log(`───────────────────────────────────────────────`);
   console.log(`  Plugin tags: //SHOW_THINKING//  //SHOW_REASONING//`);
-  console.log(`  Thinking default: disabled (explicitly set)`);
+  console.log(`  Models loaded: ${Object.keys(MODEL_CONFIG).length}`);
   console.log(`═══════════════════════════════════════════════`);
 });
